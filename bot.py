@@ -12,7 +12,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 TOKEN = "8242189843:AAGnSO5m2zJVHft_kmsAv3YGYrx3Miu-roo"
 ADMIN_ID = 8419078274
-DB_PATH = "/home/claude/anime_bot/anime.db"
+DB_PATH = "/app/anime.db"
 PAGE_SIZE = 10
 
 bot = Bot(token=TOKEN)
