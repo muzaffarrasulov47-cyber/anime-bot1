@@ -1,5 +1,7 @@
 import asyncio
 import os
+import aiosqlite
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
@@ -7,664 +9,886 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-import asyncpg
-from dotenv import load_dotenv
 
-load_dotenv()
-
-TOKEN = os.getenv("BOT_TOKEN")
-DB_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-PAGE_SIZE = 10  # Bir sahifada nechta anime
+TOKEN = "8242189843:AAGnSO5m2zJVHft_kmsAv3YGYrx3Miu-roo"
+ADMIN_ID = 8419078274
+DB_PATH = "/home/claude/anime_bot/anime.db"
+PAGE_SIZE = 10
 
 bot = Bot(token=TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+dp = Dispatcher(storage=MemoryStorage())
 
-# ═══════════════════════════════════════════
-# FSM States (Admin uchun)
-# ═══════════════════════════════════════════
+# ── FSM ──────────────────────────────────────────
 class AddAnime(StatesGroup):
     title = State()
     description = State()
-    genre = State()
-    rating = State()
-    total_episodes = State()
     cover = State()
 
 class AddEpisode(StatesGroup):
-    anime_id = State()
-    episode_number = State()
-    video = State()
+    choose_anime = State()   # admin anime tanlaydi
+    video = State()          # videolarni ketma-ket yuklaydi
 
-# ═══════════════════════════════════════════
-# DB ulanish pool
-# ═══════════════════════════════════════════
-pool = None
+class AddChannel(StatesGroup):
+    channel_input = State()  # kanal ID/username yoki forward
 
-async def create_pool():
-    global pool
-    pool = await asyncpg.create_pool(DB_URL)
-
-async def get_pool():
-    return pool
-
-# ═══════════════════════════════════════════
-# DB jadvallarini yaratish
-# ═══════════════════════════════════════════
+# ── DB init ──────────────────────────────────────
 async def init_db():
-    async with pool.acquire() as conn:
-        await conn.execute("""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript("""
             CREATE TABLE IF NOT EXISTS users (
-                id BIGINT PRIMARY KEY,
-                username VARCHAR(255),
-                joined_at TIMESTAMP DEFAULT NOW()
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-
             CREATE TABLE IF NOT EXISTS animes (
-                id SERIAL PRIMARY KEY,
-                title VARCHAR(255) NOT NULL,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
                 description TEXT,
-                genre VARCHAR(255),
-                rating FLOAT DEFAULT 0,
                 cover_file_id TEXT,
-                total_episodes INT DEFAULT 0,
-                status VARCHAR(50) DEFAULT 'ongoing',
-                created_at TIMESTAMP DEFAULT NOW()
+                total_episodes INTEGER DEFAULT 0
             );
-
             CREATE TABLE IF NOT EXISTS episodes (
-                id SERIAL PRIMARY KEY,
-                anime_id INT REFERENCES animes(id) ON DELETE CASCADE,
-                episode_number INT NOT NULL,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                anime_id INTEGER REFERENCES animes(id) ON DELETE CASCADE,
+                episode_number INTEGER NOT NULL,
                 video_file_id TEXT NOT NULL,
-                title VARCHAR(255),
                 UNIQUE(anime_id, episode_number)
             );
-
             CREATE TABLE IF NOT EXISTS favorites (
-                user_id BIGINT REFERENCES users(id),
-                anime_id INT REFERENCES animes(id) ON DELETE CASCADE,
+                user_id INTEGER,
+                anime_id INTEGER REFERENCES animes(id) ON DELETE CASCADE,
                 PRIMARY KEY (user_id, anime_id)
             );
-
             CREATE TABLE IF NOT EXISTS watch_history (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT REFERENCES users(id),
-                anime_id INT REFERENCES animes(id) ON DELETE CASCADE,
-                episode_id INT REFERENCES episodes(id) ON DELETE CASCADE,
-                watched_at TIMESTAMP DEFAULT NOW()
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                anime_id INTEGER,
+                episode_id INTEGER,
+                watched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS required_channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL UNIQUE,
+                channel_title TEXT,
+                invite_link TEXT
             );
         """)
+        await db.commit()
 
-# ═══════════════════════════════════════════
-# YORDAMCHI FUNKSIYALAR
-# ═══════════════════════════════════════════
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
+def is_admin(uid): return uid == ADMIN_ID
 
-async def register_user(user_id: int, username: str):
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (id, username)
-            VALUES ($1, $2)
-            ON CONFLICT (id) DO UPDATE SET username = $2
-        """, user_id, username)
+# ── Obuna tekshirish ─────────────────────────────
+async def check_subscriptions(user_id: int) -> list:
+    """Foydalanuvchi obuna bo'lmagan kanallar ro'yxatini qaytaradi"""
+    not_subscribed = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM required_channels") as cur:
+            channels = await cur.fetchall()
 
-# ═══════════════════════════════════════════
-# /start
-# ═══════════════════════════════════════════
+    for ch in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=ch["channel_id"], user_id=user_id)
+            if member.status in ("left", "kicked", "banned"):
+                not_subscribed.append(ch)
+        except Exception:
+            not_subscribed.append(ch)
+    return not_subscribed
+
+async def send_subscribe_message(event, not_subscribed: list):
+    """Obuna bo'lmagan kanallar tugmalarini yuboradi"""
+    builder = InlineKeyboardBuilder()
+    for ch in not_subscribed:
+        title = ch["channel_title"] or ch["channel_id"]
+        link = ch["invite_link"] or f"https://t.me/{ch['channel_id'].lstrip('@')}"
+        builder.button(text=f"📢 {title}", url=link)
+    builder.button(text="✅ Obuna bo'ldim", callback_data="check_sub")
+    builder.adjust(1)
+
+    text = (
+        "⚠️ *Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:*\n\n"
+        + "\n".join(f"• {ch['channel_title'] or ch['channel_id']}" for ch in not_subscribed)
+        + "\n\nObuna bo'lgach ✅ *Obuna bo'ldim* tugmasini bosing."
+    )
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+    else:
+        await event.message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "check_sub")
+async def cb_check_sub(call: CallbackQuery):
+    not_sub = await check_subscriptions(call.from_user.id)
+    if not_sub:
+        await call.answer("❌ Hali ham obuna bo'lmadingiz!", show_alert=True)
+        await send_subscribe_message(call, not_sub)
+    else:
+        await call.answer("✅ Rahmat! Endi botdan foydalanishingiz mumkin.", show_alert=True)
+        try:
+            await call.message.delete()
+        except:
+            pass
+        await show_main_menu(call.message, call.from_user.id)
+
+# ── /start ───────────────────────────────────────
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await register_user(message.from_user.id, message.from_user.username or "")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO users (id, username) VALUES (?,?)",
+            (message.from_user.id, message.from_user.username or "")
+        )
+        await db.commit()
 
+    not_sub = await check_subscriptions(message.from_user.id)
+    if not_sub and not is_admin(message.from_user.id):
+        await send_subscribe_message(message, not_sub)
+        return
+
+    await show_main_menu(message, message.from_user.id)
+
+async def show_main_menu(message: Message, user_id: int):
     text = (
         "🎌 *Anime Bot ga xush kelibsiz!*\n\n"
         "📋 /list — Barcha animalar\n"
-        "🔍 /search — Anime qidirish\n"
+        "🔍 /search <nom> — Qidirish\n"
         "❤️ /favorites — Sevimlilarim\n"
-        "🕐 /history — Ko'rish tarixim\n"
+        "🕐 /history — Tarixim\n"
     )
-    if is_admin(message.from_user.id):
-        text += "\n⚙️ *Admin:*\n/addanime — Anime qo'shish\n/delanime — Anime o'chirish"
+    if is_admin(user_id):
+        builder = InlineKeyboardBuilder()
+        builder.button(text="➕ Anime qo'shish", callback_data="admin_addanime")
+        builder.button(text="📤 Qism yuklash", callback_data="admin_addepisode")
+        builder.button(text="📢 Majburiy obuna", callback_data="admin_channels")
+        builder.button(text="🗑 Anime o'chirish", callback_data="admin_delanime")
+        builder.button(text="📊 Statistika", callback_data="admin_stats")
+        builder.adjust(2, 1, 2)
+        text += "\n\n⚙️ *Admin paneli quyida:*"
+        await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+    else:
+        await message.answer(text, parse_mode="Markdown")
 
-    await message.answer(text, parse_mode="Markdown")
+# ── Admin panel callback ─────────────────────────
+@dp.callback_query(F.data == "admin_addanime")
+async def cb_admin_addanime(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return
+    await state.set_state(AddAnime.title)
+    await call.message.answer("➕ *Yangi anime qo'shish*\n\nAnime nomini kiriting:", parse_mode="Markdown")
+    await call.answer()
 
-# ═══════════════════════════════════════════
-# /list — Anime ro'yxati (pagination)
-# ═══════════════════════════════════════════
-@dp.message(Command("list"))
-async def cmd_list(message: Message):
-    await show_anime_list(message, page=0)
+@dp.callback_query(F.data == "admin_addepisode")
+async def cb_admin_addepisode(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return
+    await show_anime_list_for_admin(call.message, state)
+    await call.answer()
 
-async def show_anime_list(event, page: int):
-    offset = page * PAGE_SIZE
-    async with pool.acquire() as conn:
-        animes = await conn.fetch("""
-            SELECT id, title, total_episodes, rating, status
-            FROM animes
-            ORDER BY title
-            LIMIT $1 OFFSET $2
-        """, PAGE_SIZE, offset)
+@dp.callback_query(F.data == "admin_channels")
+async def cb_admin_channels(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return
+    await show_channels_panel(call.message)
+    await call.answer()
 
-        total = await conn.fetchval("SELECT COUNT(*) FROM animes")
+@dp.callback_query(F.data == "admin_delanime")
+async def cb_admin_delanime(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, title FROM animes ORDER BY title") as cur:
+            animes = await cur.fetchall()
+    if not animes:
+        await call.message.answer("😔 Hozircha anime yo'q")
+        await call.answer(); return
+    builder = InlineKeyboardBuilder()
+    for a in animes:
+        builder.button(text=f"🗑 {a['title']}", callback_data=f"confirm_del:{a['id']}")
+    builder.adjust(1)
+    await call.message.answer("🗑 *Qaysi animeni o'chirmoqchisiz?*",
+                              reply_markup=builder.as_markup(), parse_mode="Markdown")
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("confirm_del:"))
+async def cb_confirm_del(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    aid = int(call.data.split(":")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT title FROM animes WHERE id=?", (aid,)) as cur:
+            anime = await cur.fetchone()
+        if not anime:
+            await call.answer("Topilmadi!", show_alert=True); return
+        await db.execute("DELETE FROM animes WHERE id=?", (aid,))
+        await db.commit()
+    await call.message.edit_text(f"✅ *{anime['title']}* o'chirildi!", parse_mode="Markdown")
+    await call.answer()
+
+@dp.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as c: users = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM animes") as c: animes = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM episodes") as c: eps = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM watch_history") as c: views = (await c.fetchone())[0]
+    await call.message.answer(
+        f"📊 *Statistika:*\n\n"
+        f"👥 Foydalanuvchilar: *{users}*\n"
+        f"🎬 Animalar: *{animes}*\n"
+        f"▶️ Epizodlar: *{eps}*\n"
+        f"👁 Ko'rishlar: *{views}*",
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+# ── Anime qo'shish (soddalashtirilgan: nom, tavsif, rasm) ──
+@dp.message(Command("addanime"))
+async def adm_addanime(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await state.set_state(AddAnime.title)
+    await message.answer("➕ *Yangi anime qo'shish*\n\nAnime nomini kiriting:", parse_mode="Markdown")
+
+@dp.message(AddAnime.title)
+async def adm_an_title(message: Message, state: FSMContext):
+    await state.update_data(title=message.text.strip())
+    await state.set_state(AddAnime.description)
+    await message.answer("📝 Anime tavsifini kiriting (yoki /skip):")
+
+@dp.message(AddAnime.description)
+async def adm_an_desc(message: Message, state: FSMContext):
+    desc = "" if message.text == "/skip" else message.text.strip()
+    await state.update_data(description=desc)
+    await state.set_state(AddAnime.cover)
+    await message.answer("🖼 Anime uchun rasm yuboring (yoki /skip):")
+
+@dp.message(AddAnime.cover)
+async def adm_an_cover(message: Message, state: FSMContext):
+    cover_id = None
+    if message.photo:
+        cover_id = message.photo[-1].file_id
+    elif message.text != "/skip":
+        await message.answer("🖼 Rasm yuboring yoki /skip ni yozing!"); return
+
+    d = await state.get_data()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO animes (title, description, cover_file_id) VALUES (?,?,?)",
+            (d["title"], d["description"], cover_id)
+        )
+        anime_id = cur.lastrowid
+        await db.commit()
+
+    await state.clear()
+    await message.answer(
+        f"✅ *{d['title']}* muvaffaqiyatli qo'shildi!\n🆔 ID: `{anime_id}`\n\n"
+        f"Endi qism yuklash uchun admin paneldan 📤 *Qism yuklash* tugmasini bosing.",
+        parse_mode="Markdown"
+    )
+
+# ── Qism yuklash — anime ro'yxati ────────────────
+async def show_anime_list_for_admin(message: Message, state: FSMContext):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, title, total_episodes FROM animes ORDER BY title"
+        ) as cur:
+            animes = await cur.fetchall()
 
     if not animes:
-        text = "😔 Hozircha anime yo'q"
-        if isinstance(event, Message):
-            await event.answer(text)
-        else:
-            await event.message.edit_text(text)
+        await message.answer(
+            "😔 Hozircha anime yo'q.\n\nAvval anime qo'shing: admin paneldan ➕ *Anime qo'shish*",
+            parse_mode="Markdown"
+        )
         return
 
     builder = InlineKeyboardBuilder()
     for a in animes:
-        status_icon = "🟢" if a['status'] == 'ongoing' else "✅"
         builder.button(
-            text=f"🎬 {a['title']} [{a['total_episodes']} qism] {status_icon}",
-            callback_data=f"anime_{a['id']}_0"
+            text=f"🎬 {a['title']} [{a['total_episodes']} qism]",
+            callback_data=f"adm_ep_anime:{a['id']}"
+        )
+    builder.adjust(1)
+    await state.set_state(AddEpisode.choose_anime)
+    await message.answer(
+        "📤 *Qism yuklash*\n\nQaysi animega qism qo'shmoqchisiz?",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
+    )
+
+@dp.message(Command("addepisode"))
+async def adm_addep_cmd(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await show_anime_list_for_admin(message, state)
+
+@dp.callback_query(F.data.startswith("adm_ep_anime:"))
+async def cb_adm_ep_anime(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return
+    anime_id = int(call.data.split(":")[1])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM animes WHERE id=?", (anime_id,)) as cur:
+            anime = await cur.fetchone()
+        async with db.execute(
+            "SELECT MAX(episode_number) as last FROM episodes WHERE anime_id=?", (anime_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        last_ep = row["last"] or 0
+        next_ep = last_ep + 1
+
+    await state.update_data(anime_id=anime_id, anime_title=anime["title"], next_ep=next_ep)
+    await state.set_state(AddEpisode.video)
+
+    await call.message.edit_text(
+        f"🎬 *{anime['title']}*\n\n"
+        f"✅ Hozirga *{last_ep}* ta qism yuklangan.\n\n"
+        f"▶️ Endi *{next_ep}-qism* videosini yuboring.\n"
+        f"_(Videolarni ketma-ket yuboring, har biri avtomatik raqamlashadi)_\n\n"
+        f"To'xtatish uchun: /done",
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+@dp.message(AddEpisode.video, F.video)
+async def adm_ep_video(message: Message, state: FSMContext):
+    d = await state.get_data()
+    anime_id = d["anime_id"]
+    anime_title = d["anime_title"]
+    next_ep = d["next_ep"]
+    fid = message.video.file_id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO episodes (anime_id, episode_number, video_file_id)
+            VALUES (?,?,?)
+            ON CONFLICT(anime_id, episode_number)
+            DO UPDATE SET video_file_id=excluded.video_file_id
+        """, (anime_id, next_ep, fid))
+        await db.execute(
+            "UPDATE animes SET total_episodes = (SELECT COUNT(*) FROM episodes WHERE anime_id=?) WHERE id=?",
+            (anime_id, anime_id)
+        )
+        await db.commit()
+
+    new_next = next_ep + 1
+    await state.update_data(next_ep=new_next)
+
+    await message.answer(
+        f"✅ *{anime_title}* — *{next_ep}-qism* saqlandi!\n\n"
+        f"▶️ Endi *{new_next}-qism* videosini yuboring.\n"
+        f"To'xtatish uchun: /done",
+        parse_mode="Markdown"
+    )
+
+@dp.message(AddEpisode.video)
+async def adm_ep_wrong(message: Message, state: FSMContext):
+    if message.text and message.text.startswith("/done"):
+        d = await state.get_data()
+        last = d.get("next_ep", 1) - 1
+        await state.clear()
+        await message.answer(
+            f"✅ *{d.get('anime_title', 'Anime')}* uchun jami *{last}* qism yuklandi!",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer("❌ Video yuboring yoki /done ni yozing!")
+
+@dp.message(Command("done"))
+async def cmd_done(message: Message, state: FSMContext):
+    current = await state.get_state()
+    if current == AddEpisode.video:
+        d = await state.get_data()
+        last = d.get("next_ep", 1) - 1
+        await state.clear()
+        await message.answer(
+            f"✅ *{d.get('anime_title', 'Anime')}* uchun jami *{last}* qism yuklandi!",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer("Hozir yuklash jarayoni yo'q.")
+
+# ── Majburiy obuna boshqaruvi ────────────────────
+async def show_channels_panel(message: Message):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM required_channels") as cur:
+            channels = await cur.fetchall()
+
+    builder = InlineKeyboardBuilder()
+    text = "📢 *Majburiy obuna kanallari:*\n\n"
+
+    if channels:
+        for ch in channels:
+            text += f"• {ch['channel_title'] or ch['channel_id']} (`{ch['channel_id']}`)\n"
+            builder.button(
+                text=f"🗑 {ch['channel_title'] or ch['channel_id']}ni o'chirish",
+                callback_data=f"del_channel:{ch['id']}"
+            )
+        builder.adjust(1)
+    else:
+        text += "_(Hozircha kanal yo'q)_\n"
+
+    builder.button(text="➕ Kanal qo'shish", callback_data="add_channel")
+    builder.adjust(1)
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "add_channel")
+async def cb_add_channel(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return
+    await state.set_state(AddChannel.channel_input)
+    await call.message.answer(
+        "📢 *Kanal qo'shish*\n\n"
+        "Quyidagilardan birini yuboring:\n"
+        "1️⃣ Kanal username: `@kanalnom`\n"
+        "2️⃣ Kanal ID: `-1001234567890`\n"
+        "3️⃣ Kanaldan istalgan xabarni *forward* qiling\n\n"
+        "⚠️ Bot kanalga admin bo'lishi kerak!",
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+@dp.message(AddChannel.channel_input)
+async def adm_channel_input(message: Message, state: FSMContext):
+    channel_id = None
+    channel_title = None
+    invite_link = None
+
+    # Forward qilingan xabar
+    if message.forward_from_chat:
+        chat = message.forward_from_chat
+        channel_id = str(chat.id)
+        channel_title = chat.title
+        try:
+            invite = await bot.create_chat_invite_link(chat.id)
+            invite_link = invite.invite_link
+        except:
+            invite_link = f"https://t.me/{chat.username}" if chat.username else None
+
+    # Username yoki ID
+    elif message.text:
+        raw = message.text.strip()
+        try:
+            chat = await bot.get_chat(raw)
+            channel_id = str(chat.id)
+            channel_title = chat.title
+            try:
+                invite = await bot.create_chat_invite_link(chat.id)
+                invite_link = invite.invite_link
+            except:
+                invite_link = f"https://t.me/{chat.username}" if chat.username else None
+        except Exception as e:
+            await message.answer(
+                f"❌ Kanal topilmadi: `{raw}`\n\n"
+                f"Bot kanalga admin qilinganmi?\nXato: {e}",
+                parse_mode="Markdown"
+            )
+            return
+    else:
+        await message.answer("❌ Kanal username, ID yoki forward xabar yuboring!")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO required_channels (channel_id, channel_title, invite_link) VALUES (?,?,?)",
+                (channel_id, channel_title, invite_link)
+            )
+            await db.commit()
+        except Exception:
+            await message.answer("⚠️ Bu kanal allaqachon qo'shilgan!")
+            await state.clear()
+            return
+
+    await state.clear()
+    await message.answer(
+        f"✅ *{channel_title or channel_id}* kanali qo'shildi!\n\n"
+        f"ID: `{channel_id}`\n"
+        f"Havola: {invite_link or 'mavjud emas'}",
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("del_channel:"))
+async def cb_del_channel(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    ch_id = int(call.data.split(":")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM required_channels WHERE id=?", (ch_id,)) as cur:
+            ch = await cur.fetchone()
+        if not ch:
+            await call.answer("Topilmadi!", show_alert=True); return
+        await db.execute("DELETE FROM required_channels WHERE id=?", (ch_id,))
+        await db.commit()
+    await call.answer(f"✅ {ch['channel_title'] or ch['channel_id']} o'chirildi", show_alert=True)
+    await show_channels_panel(call.message)
+
+# ── /list ────────────────────────────────────────
+@dp.message(Command("list"))
+async def cmd_list(message: Message):
+    not_sub = await check_subscriptions(message.from_user.id)
+    if not_sub and not is_admin(message.from_user.id):
+        await send_subscribe_message(message, not_sub); return
+    await show_list(message, 0)
+
+async def show_list(event, page):
+    offset = page * PAGE_SIZE
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, title, total_episodes FROM animes ORDER BY title LIMIT ? OFFSET ?",
+            (PAGE_SIZE, offset)
+        ) as cur:
+            animes = await cur.fetchall()
+        async with db.execute("SELECT COUNT(*) FROM animes") as cur:
+            total = (await cur.fetchone())[0]
+
+    if not animes:
+        txt = "😔 Hozircha anime yo'q"
+        if isinstance(event, Message):
+            await event.answer(txt)
+        else:
+            await event.message.edit_text(txt)
+        return
+
+    builder = InlineKeyboardBuilder()
+    for a in animes:
+        builder.button(
+            text=f"🎬 {a['title']}  [{a['total_episodes']} qism]",
+            callback_data=f"anime:{a['id']}:{page}"
         )
     builder.adjust(1)
 
-    # Pagination tugmalari
-    nav_buttons = []
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    nav = []
     if page > 0:
-        nav_buttons.append(("⬅️ Oldingi", f"page_{page-1}"))
+        nav.append(("⬅️ Oldingi", f"page:{page-1}"))
     if offset + PAGE_SIZE < total:
-        nav_buttons.append(("Keyingi ➡️", f"page_{page+1}"))
+        nav.append(("Keyingi ➡️", f"page:{page+1}"))
+    for t, d in nav:
+        builder.button(text=t, callback_data=d)
+    if nav:
+        builder.adjust(1, len(nav))
 
-    for btn_text, btn_data in nav_buttons:
-        builder.button(text=btn_text, callback_data=btn_data)
-
-    total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-    header = f"📋 *Animalar* ({page+1}/{total_pages} sahifa, jami: {total} ta)\n"
-
+    header = f"📋 *Animalar* ({page+1}/{total_pages} sahifa • jami {total} ta)\n"
     if isinstance(event, Message):
         await event.answer(header, reply_markup=builder.as_markup(), parse_mode="Markdown")
     else:
         await event.message.edit_text(header, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@dp.callback_query(F.data.startswith("page_"))
-async def pagination_handler(call: CallbackQuery):
-    page = int(call.data.split("_")[1])
-    await show_anime_list(call, page)
+@dp.callback_query(F.data.startswith("page:"))
+async def cb_page(call: CallbackQuery):
+    not_sub = await check_subscriptions(call.from_user.id)
+    if not_sub and not is_admin(call.from_user.id):
+        await send_subscribe_message(call, not_sub)
+        await call.answer(); return
+    page = int(call.data.split(":")[1])
+    await show_list(call, page)
     await call.answer()
 
-# ═══════════════════════════════════════════
-# Anime detail sahifasi
-# ═══════════════════════════════════════════
-@dp.callback_query(F.data.startswith("anime_"))
-async def anime_detail(call: CallbackQuery):
-    parts = call.data.split("_")
-    anime_id = int(parts[1])
-    back_page = int(parts[2]) if len(parts) > 2 else 0
+# ── Anime detail ─────────────────────────────────
+@dp.callback_query(F.data.startswith("anime:"))
+async def cb_anime(call: CallbackQuery):
+    not_sub = await check_subscriptions(call.from_user.id)
+    if not_sub and not is_admin(call.from_user.id):
+        await send_subscribe_message(call, not_sub)
+        await call.answer(); return
 
-    async with pool.acquire() as conn:
-        anime = await conn.fetchrow("SELECT * FROM animes WHERE id = $1", anime_id)
-        episodes = await conn.fetch("""
-            SELECT id, episode_number, title
-            FROM episodes
-            WHERE anime_id = $1
-            ORDER BY episode_number
-        """, anime_id)
-        is_fav = await conn.fetchval("""
-            SELECT 1 FROM favorites WHERE user_id = $1 AND anime_id = $2
-        """, call.from_user.id, anime_id)
+    parts = call.data.split(":")
+    anime_id, back_page = int(parts[1]), int(parts[2])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM animes WHERE id=?", (anime_id,)) as cur:
+            anime = await cur.fetchone()
+        async with db.execute(
+            "SELECT id, episode_number FROM episodes WHERE anime_id=? ORDER BY episode_number",
+            (anime_id,)
+        ) as cur:
+            episodes = await cur.fetchall()
+        async with db.execute(
+            "SELECT 1 FROM favorites WHERE user_id=? AND anime_id=?",
+            (call.from_user.id, anime_id)
+        ) as cur:
+            is_fav = await cur.fetchone()
 
     if not anime:
-        await call.answer("Anime topilmadi!", show_alert=True)
+        await call.answer("Topilmadi!", show_alert=True)
         return
 
-    # Qismlar tugmalari (3 tadan qator)
     builder = InlineKeyboardBuilder()
+    # Barcha qismlar tugmalari
     for ep in episodes:
-        ep_title = ep['title'] or f"{ep['episode_number']}-qism"
         builder.button(
             text=f"▶️ {ep['episode_number']}-qism",
-            callback_data=f"ep_{ep['id']}_{anime_id}_{back_page}"
+            callback_data=f"ep:{ep['id']}:{anime_id}:{back_page}"
         )
     builder.adjust(3)
 
-    # Sevimli + Orqaga
-    fav_text = "💔 Sevimlilardan olib tashlash" if is_fav else "❤️ Sevimliga qo'shish"
-    builder.button(text=fav_text, callback_data=f"fav_{anime_id}_{back_page}")
-    builder.button(text="🔙 Ro'yxatga qaytish", callback_data=f"page_{back_page}")
+    fav_txt = "💔 Sevimlilardan olib tashlash" if is_fav else "❤️ Sevimliga qo'shish"
+    builder.button(text=fav_txt, callback_data=f"fav:{anime_id}:{back_page}")
+    builder.button(text="🔙 Ro'yxatga qaytish", callback_data=f"page:{back_page}")
     builder.adjust(3, 1, 1)
 
-    status_text = "🟢 Davom etmoqda" if anime['status'] == 'ongoing' else "✅ Tugallangan"
+    desc = (anime["description"] or "Tavsif yo'q")[:400]
+    ep_count = len(episodes)
     text = (
         f"🎬 *{anime['title']}*\n\n"
-        f"⭐ Reyting: *{anime['rating']}*\n"
-        f"📺 Jami qismlar: *{anime['total_episodes']}*\n"
-        f"🎭 Janr: {anime['genre'] or 'Noma\'lum'}\n"
-        f"📊 Status: {status_text}\n\n"
-        f"📝 {(anime['description'] or '')[:400]}"
+        f"📺 Yuklangan qismlar: *{ep_count}* ta\n\n"
+        f"📝 *Tavsif:*\n{desc}"
     )
 
-    if anime['cover_file_id']:
+    if anime["cover_file_id"]:
         try:
             await call.message.delete()
         except:
             pass
         await call.message.answer_photo(
-            photo=anime['cover_file_id'],
+            photo=anime["cover_file_id"],
             caption=text,
             reply_markup=builder.as_markup(),
             parse_mode="Markdown"
         )
     else:
-        await call.message.edit_text(
-            text,
-            reply_markup=builder.as_markup(),
-            parse_mode="Markdown"
-        )
+        try:
+            await call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+        except:
+            await call.message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
     await call.answer()
 
-# ═══════════════════════════════════════════
-# Epizod yuborish
-# ═══════════════════════════════════════════
-@dp.callback_query(F.data.startswith("ep_"))
-async def send_episode(call: CallbackQuery):
-    parts = call.data.split("_")
-    ep_id = int(parts[1])
-    anime_id = int(parts[2])
-    back_page = int(parts[3]) if len(parts) > 3 else 0
+# ── Epizod ───────────────────────────────────────
+@dp.callback_query(F.data.startswith("ep:"))
+async def cb_episode(call: CallbackQuery):
+    not_sub = await check_subscriptions(call.from_user.id)
+    if not_sub and not is_admin(call.from_user.id):
+        await send_subscribe_message(call, not_sub)
+        await call.answer(); return
 
-    async with pool.acquire() as conn:
-        ep = await conn.fetchrow("""
-            SELECT e.*, a.title as anime_title, a.total_episodes
-            FROM episodes e
-            JOIN animes a ON e.anime_id = a.id
-            WHERE e.id = $1
-        """, ep_id)
+    parts = call.data.split(":")
+    ep_id, anime_id, back_page = int(parts[1]), int(parts[2]), int(parts[3])
 
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT e.*, a.title AS anime_title, a.total_episodes
+            FROM episodes e JOIN animes a ON e.anime_id=a.id
+            WHERE e.id=?
+        """, (ep_id,)) as cur:
+            ep = await cur.fetchone()
         if not ep:
-            await call.answer("Epizod topilmadi!", show_alert=True)
+            await call.answer("Topilmadi!", show_alert=True)
             return
+        async with db.execute(
+            "SELECT id FROM episodes WHERE anime_id=? AND episode_number=?",
+            (anime_id, ep["episode_number"] - 1)
+        ) as cur:
+            prev_ep = await cur.fetchone()
+        async with db.execute(
+            "SELECT id FROM episodes WHERE anime_id=? AND episode_number=?",
+            (anime_id, ep["episode_number"] + 1)
+        ) as cur:
+            next_ep = await cur.fetchone()
+        await db.execute(
+            "INSERT INTO watch_history (user_id, anime_id, episode_id) VALUES (?,?,?)",
+            (call.from_user.id, anime_id, ep_id)
+        )
+        await db.commit()
 
-        # Tarixga yozish
-        await conn.execute("""
-            INSERT INTO watch_history (user_id, anime_id, episode_id)
-            VALUES ($1, $2, $3)
-        """, call.from_user.id, anime_id, ep_id)
-
-        # Oldingi va keyingi epizodlar
-        prev_ep = await conn.fetchrow("""
-            SELECT id FROM episodes
-            WHERE anime_id = $1 AND episode_number = $2
-        """, anime_id, ep['episode_number'] - 1)
-
-        next_ep = await conn.fetchrow("""
-            SELECT id FROM episodes
-            WHERE anime_id = $1 AND episode_number = $2
-        """, anime_id, ep['episode_number'] + 1)
-
-    # Navigation tugmalari
     builder = InlineKeyboardBuilder()
     if prev_ep:
-        builder.button(text="⬅️ Oldingi qism", callback_data=f"ep_{prev_ep['id']}_{anime_id}_{back_page}")
+        builder.button(text="⬅️ Oldingi", callback_data=f"ep:{prev_ep['id']}:{anime_id}:{back_page}")
     if next_ep:
-        builder.button(text="Keyingi qism ➡️", callback_data=f"ep_{next_ep['id']}_{anime_id}_{back_page}")
-    builder.button(text="🔙 Anime sahifasiga", callback_data=f"anime_{anime_id}_{back_page}")
-    builder.adjust(2, 1)
+        builder.button(text="Keyingi ➡️", callback_data=f"ep:{next_ep['id']}:{anime_id}:{back_page}")
+    builder.button(text="🔙 Animega qaytish", callback_data=f"anime:{anime_id}:{back_page}")
+    cols = 2 if (prev_ep and next_ep) else 1
+    builder.adjust(cols, 1)
+
+    # Anime nomi va qism raqami aniq ko'rsatiladi
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM episodes WHERE anime_id=?", (anime_id,)
+        ) as cur:
+            total_uploaded = (await cur.fetchone())[0]
 
     caption = (
-        f"🎬 *{ep['anime_title']}*\n"
-        f"▶️ *{ep['episode_number']}-qism*"
-        f" / {ep['total_episodes']}\n\n"
-        f"⬅️ Oldingi | Keyingi ➡️"
+        f"🎌 *{ep['anime_title']}*\n"
+        f"▶️ *{ep['episode_number']}-qism*  /  {total_uploaded} qism"
     )
-
     await call.message.answer_video(
-        video=ep['video_file_id'],
+        video=ep["video_file_id"],
         caption=caption,
         reply_markup=builder.as_markup(),
         parse_mode="Markdown"
     )
     await call.answer()
 
-# ═══════════════════════════════════════════
-# Sevimlilar
-# ═══════════════════════════════════════════
-@dp.callback_query(F.data.startswith("fav_"))
-async def toggle_favorite(call: CallbackQuery):
-    parts = call.data.split("_")
+# ── Sevimlilar ───────────────────────────────────
+@dp.callback_query(F.data.startswith("fav:"))
+async def cb_fav(call: CallbackQuery):
+    parts = call.data.split(":")
     anime_id = int(parts[1])
-    back_page = int(parts[2]) if len(parts) > 2 else 0
-
-    async with pool.acquire() as conn:
-        existing = await conn.fetchval("""
-            SELECT 1 FROM favorites WHERE user_id = $1 AND anime_id = $2
-        """, call.from_user.id, anime_id)
-
-        if existing:
-            await conn.execute("""
-                DELETE FROM favorites WHERE user_id = $1 AND anime_id = $2
-            """, call.from_user.id, anime_id)
-            await call.answer("💔 Sevimlilardan olib tashlandi", show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM favorites WHERE user_id=? AND anime_id=?",
+            (call.from_user.id, anime_id)
+        ) as cur:
+            exists = await cur.fetchone()
+        if exists:
+            await db.execute("DELETE FROM favorites WHERE user_id=? AND anime_id=?",
+                             (call.from_user.id, anime_id))
+            msg = "💔 Sevimlilardan olib tashlandi"
         else:
-            await conn.execute("""
-                INSERT INTO favorites (user_id, anime_id) VALUES ($1, $2)
-            """, call.from_user.id, anime_id)
-            await call.answer("❤️ Sevimliga qo'shildi!", show_alert=True)
-
-    # Sahifani yangilash
-    await anime_detail(call)
+            await db.execute("INSERT INTO favorites (user_id, anime_id) VALUES (?,?)",
+                             (call.from_user.id, anime_id))
+            msg = "❤️ Sevimliga qo'shildi!"
+        await db.commit()
+    await call.answer(msg, show_alert=True)
+    call.data = f"anime:{anime_id}:{parts[2]}"
+    await cb_anime(call)
 
 @dp.message(Command("favorites"))
-async def cmd_favorites(message: Message):
-    async with pool.acquire() as conn:
-        animes = await conn.fetch("""
-            SELECT a.id, a.title, a.total_episodes
-            FROM favorites f
-            JOIN animes a ON f.anime_id = a.id
-            WHERE f.user_id = $1
-            ORDER BY a.title
-        """, message.from_user.id)
+async def cmd_favs(message: Message):
+    not_sub = await check_subscriptions(message.from_user.id)
+    if not_sub and not is_admin(message.from_user.id):
+        await send_subscribe_message(message, not_sub); return
 
-    if not animes:
-        await message.answer("❤️ Sevimlilar ro'yxati bo'sh\n\n/list dan anime qo'shing!")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT a.id, a.title, a.total_episodes
+            FROM favorites f JOIN animes a ON f.anime_id=a.id
+            WHERE f.user_id=? ORDER BY a.title
+        """, (message.from_user.id,)) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await message.answer("❤️ Sevimlilar bo'sh\n\n/list dan animani ochib ❤️ bosing!")
         return
 
     builder = InlineKeyboardBuilder()
-    for a in animes:
+    for a in rows:
         builder.button(
             text=f"🎬 {a['title']} [{a['total_episodes']} qism]",
-            callback_data=f"anime_{a['id']}_0"
+            callback_data=f"anime:{a['id']}:0"
         )
     builder.adjust(1)
-
     await message.answer(
-        f"❤️ *Sevimli animalarim* ({len(animes)} ta):",
+        f"❤️ *Sevimlilarim* ({len(rows)} ta):",
         reply_markup=builder.as_markup(),
         parse_mode="Markdown"
     )
 
-# ═══════════════════════════════════════════
-# Ko'rish tarixi
-# ═══════════════════════════════════════════
+# ── Tarix ────────────────────────────────────────
 @dp.message(Command("history"))
 async def cmd_history(message: Message):
-    async with pool.acquire() as conn:
-        history = await conn.fetch("""
-            SELECT DISTINCT ON (a.id) a.id, a.title, e.episode_number, wh.watched_at
-            FROM watch_history wh
-            JOIN animes a ON wh.anime_id = a.id
-            JOIN episodes e ON wh.episode_id = e.id
-            WHERE wh.user_id = $1
-            ORDER BY a.id, wh.watched_at DESC
-            LIMIT 10
-        """, message.from_user.id)
+    not_sub = await check_subscriptions(message.from_user.id)
+    if not_sub and not is_admin(message.from_user.id):
+        await send_subscribe_message(message, not_sub); return
 
-    if not history:
-        await message.answer("🕐 Ko'rish tarixi bo'sh")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT a.id, a.title, e.episode_number
+            FROM watch_history wh
+            JOIN animes a ON wh.anime_id=a.id
+            JOIN episodes e ON wh.episode_id=e.id
+            WHERE wh.user_id=?
+            GROUP BY a.id
+            ORDER BY MAX(wh.watched_at) DESC
+            LIMIT 10
+        """, (message.from_user.id,)) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await message.answer("🕐 Tarix bo'sh")
         return
 
     builder = InlineKeyboardBuilder()
-    for h in history:
+    for h in rows:
         builder.button(
             text=f"🎬 {h['title']} — {h['episode_number']}-qism",
-            callback_data=f"anime_{h['id']}_0"
+            callback_data=f"anime:{h['id']}:0"
         )
     builder.adjust(1)
+    await message.answer("🕐 *Oxirgi ko'rganlarim:*",
+                         reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-    await message.answer(
-        "🕐 *Oxirgi ko'rganlarim:*",
-        reply_markup=builder.as_markup(),
-        parse_mode="Markdown"
-    )
-
-# ═══════════════════════════════════════════
-# Qidirish
-# ═══════════════════════════════════════════
+# ── Qidirish ─────────────────────────────────────
 @dp.message(Command("search"))
 async def cmd_search(message: Message):
-    query = message.text.replace("/search", "").strip()
-    if not query:
+    not_sub = await check_subscriptions(message.from_user.id)
+    if not_sub and not is_admin(message.from_user.id):
+        await send_subscribe_message(message, not_sub); return
+
+    q = message.text.replace("/search", "").strip()
+    if not q:
         await message.answer("🔍 Misol: /search Naruto")
         return
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, title, total_episodes FROM animes WHERE title LIKE ? ORDER BY title LIMIT 10",
+            (f"%{q}%",)
+        ) as cur:
+            rows = await cur.fetchall()
 
-    async with pool.acquire() as conn:
-        animes = await conn.fetch("""
-            SELECT id, title, total_episodes
-            FROM animes
-            WHERE title ILIKE $1
-            ORDER BY title
-            LIMIT 10
-        """, f"%{query}%")
-
-    if not animes:
-        await message.answer(f"😔 *{query}* bo'yicha hech narsa topilmadi")
+    if not rows:
+        await message.answer(f"😔 *{q}* topilmadi", parse_mode="Markdown")
         return
 
     builder = InlineKeyboardBuilder()
-    for a in animes:
+    for a in rows:
         builder.button(
             text=f"🎬 {a['title']} [{a['total_episodes']} qism]",
-            callback_data=f"anime_{a['id']}_0"
+            callback_data=f"anime:{a['id']}:0"
         )
     builder.adjust(1)
-
     await message.answer(
-        f"🔍 *'{query}'* bo'yicha natijalar ({len(animes)} ta):",
+        f"🔍 *'{q}'* — {len(rows)} ta natija:",
         reply_markup=builder.as_markup(),
         parse_mode="Markdown"
     )
 
-# ═══════════════════════════════════════════════════════
-# ⚙️ ADMIN — Anime qo'shish (bosqichma-bosqich FSM)
-# ═══════════════════════════════════════════════════════
-@dp.message(Command("addanime"))
-async def admin_add_anime(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    await state.set_state(AddAnime.title)
-    await message.answer("➕ *Yangi anime qo'shish*\n\nAnime nomini kiriting:", parse_mode="Markdown")
-
-@dp.message(AddAnime.title)
-async def add_anime_title(message: Message, state: FSMContext):
-    await state.update_data(title=message.text)
-    await state.set_state(AddAnime.description)
-    await message.answer("📝 Tavsif kiriting (yoki /skip):")
-
-@dp.message(AddAnime.description)
-async def add_anime_desc(message: Message, state: FSMContext):
-    desc = "" if message.text == "/skip" else message.text
-    await state.update_data(description=desc)
-    await state.set_state(AddAnime.genre)
-    await message.answer("🎭 Janr kiriting (masalan: Action, Comedy) yoki /skip:")
-
-@dp.message(AddAnime.genre)
-async def add_anime_genre(message: Message, state: FSMContext):
-    genre = "" if message.text == "/skip" else message.text
-    await state.update_data(genre=genre)
-    await state.set_state(AddAnime.rating)
-    await message.answer("⭐ Reyting kiriting (0-10) yoki /skip:")
-
-@dp.message(AddAnime.rating)
-async def add_anime_rating(message: Message, state: FSMContext):
-    try:
-        rating = 0.0 if message.text == "/skip" else float(message.text)
-    except:
-        await message.answer("❌ Raqam kiriting! (masalan: 8.5)")
-        return
-    await state.update_data(rating=rating)
-    await state.set_state(AddAnime.total_episodes)
-    await message.answer("📺 Jami epizodlar sonini kiriting:")
-
-@dp.message(AddAnime.total_episodes)
-async def add_anime_episodes(message: Message, state: FSMContext):
-    try:
-        total = int(message.text)
-    except:
-        await message.answer("❌ Butun son kiriting!")
-        return
-    await state.update_data(total_episodes=total)
-    await state.set_state(AddAnime.cover)
-    await message.answer("🖼 Cover rasmini yuboring (yoki /skip):")
-
-@dp.message(AddAnime.cover)
-async def add_anime_cover(message: Message, state: FSMContext):
-    cover_id = None
-    if message.photo:
-        cover_id = message.photo[-1].file_id
-    elif message.text != "/skip":
-        await message.answer("🖼 Rasm yuboring yoki /skip yozing!")
-        return
-
-    data = await state.get_data()
-    async with pool.acquire() as conn:
-        anime_id = await conn.fetchval("""
-            INSERT INTO animes (title, description, genre, rating, total_episodes, cover_file_id)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id
-        """, data['title'], data['description'], data['genre'],
-            data['rating'], data['total_episodes'], cover_id)
-
-    await state.clear()
-    await message.answer(
-        f"✅ *{data['title']}* qo'shildi!\n"
-        f"🆔 Anime ID: `{anime_id}`\n\n"
-        f"Endi epizod yuklash uchun:\n"
-        f"/addepisode",
-        parse_mode="Markdown"
-    )
-
-# ═══════════════════════════════════════════════════════
-# ⚙️ ADMIN — Epizod qo'shish (FSM)
-# ═══════════════════════════════════════════════════════
-@dp.message(Command("addepisode"))
-async def admin_add_episode(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    await state.set_state(AddEpisode.anime_id)
-    await message.answer(
-        "📺 *Epizod qo'shish*\n\n"
-        "Anime ID sini kiriting:\n"
-        "(Anime ID ni /list dan topishingiz mumkin)",
-        parse_mode="Markdown"
-    )
-
-@dp.message(AddEpisode.anime_id)
-async def add_ep_anime_id(message: Message, state: FSMContext):
-    try:
-        anime_id = int(message.text)
-    except:
-        await message.answer("❌ Raqam kiriting!")
-        return
-
-    async with pool.acquire() as conn:
-        anime = await conn.fetchrow("SELECT id, title FROM animes WHERE id = $1", anime_id)
-
-    if not anime:
-        await message.answer(f"❌ ID={anime_id} anime topilmadi!")
-        return
-
-    await state.update_data(anime_id=anime_id)
-    await state.set_state(AddEpisode.episode_number)
-    await message.answer(f"✅ *{anime['title']}*\n\nQism raqamini kiriting:", parse_mode="Markdown")
-
-@dp.message(AddEpisode.episode_number)
-async def add_ep_number(message: Message, state: FSMContext):
-    try:
-        ep_num = int(message.text)
-    except:
-        await message.answer("❌ Raqam kiriting!")
-        return
-
-    await state.update_data(episode_number=ep_num)
-    await state.set_state(AddEpisode.video)
-    await message.answer(f"▶️ *{ep_num}-qism* videosini yuboring:", parse_mode="Markdown")
-
-@dp.message(AddEpisode.video, F.video)
-async def add_ep_video(message: Message, state: FSMContext):
-    data = await state.get_data()
-    file_id = message.video.file_id
-
-    loading = await message.answer("⏳ Saqlanmoqda...")
-
-    async with pool.acquire() as conn:
-        try:
-            await conn.execute("""
-                INSERT INTO episodes (anime_id, episode_number, video_file_id)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (anime_id, episode_number)
-                DO UPDATE SET video_file_id = $3
-            """, data['anime_id'], data['episode_number'], file_id)
-        except Exception as e:
-            await loading.edit_text(f"❌ Xato: {e}")
-            return
-
-    await state.clear()
-    await loading.edit_text(
-        f"✅ *{data['episode_number']}-qism* saqlandi!\n\n"
-        f"Yana epizod qo'shish: /addepisode",
-        parse_mode="Markdown"
-    )
-
-@dp.message(AddEpisode.video)
-async def add_ep_video_wrong(message: Message):
-    await message.answer("❌ Video yuboring (fayl emas, video format)!")
-
-# ═══════════════════════════════════════════════════════
-# ⚙️ ADMIN — Anime o'chirish
-# ═══════════════════════════════════════════════════════
-@dp.message(Command("delanime"))
-async def admin_del_anime(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("❌ Format: /delanime <anime_id>")
-        return
-
-    try:
-        anime_id = int(parts[1])
-    except:
-        await message.answer("❌ Raqam kiriting!")
-        return
-
-    async with pool.acquire() as conn:
-        anime = await conn.fetchrow("SELECT title FROM animes WHERE id = $1", anime_id)
-        if not anime:
-            await message.answer(f"❌ ID={anime_id} anime topilmadi!")
-            return
-        await conn.execute("DELETE FROM animes WHERE id = $1", anime_id)
-
-    await message.answer(f"✅ *{anime['title']}* o'chirildi!", parse_mode="Markdown")
-
-# ═══════════════════════════════════════════════════════
-# ⚙️ ADMIN — Statistika
-# ═══════════════════════════════════════════════════════
+# ── Admin /stats va /delanime komandalar ─────────
 @dp.message(Command("stats"))
-async def admin_stats(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    async with pool.acquire() as conn:
-        users = await conn.fetchval("SELECT COUNT(*) FROM users")
-        animes = await conn.fetchval("SELECT COUNT(*) FROM animes")
-        episodes = await conn.fetchval("SELECT COUNT(*) FROM episodes")
-        views = await conn.fetchval("SELECT COUNT(*) FROM watch_history")
-
+async def adm_stats(message: Message):
+    if not is_admin(message.from_user.id): return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as c: users = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM animes") as c: animes = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM episodes") as c: eps = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM watch_history") as c: views = (await c.fetchone())[0]
     await message.answer(
-        f"📊 *Bot statistikasi:*\n\n"
+        f"📊 *Statistika:*\n\n"
         f"👥 Foydalanuvchilar: *{users}*\n"
         f"🎬 Animalar: *{animes}*\n"
-        f"▶️ Epizodlar: *{episodes}*\n"
-        f"👁 Jami ko'rishlar: *{views}*",
+        f"▶️ Epizodlar: *{eps}*\n"
+        f"👁 Ko'rishlar: *{views}*",
         parse_mode="Markdown"
     )
 
-# ═══════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════
+@dp.message(Command("delanime"))
+async def adm_del(message: Message):
+    if not is_admin(message.from_user.id): return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Format: /delanime <id>"); return
+    try:
+        aid = int(parts[1])
+    except:
+        await message.answer("❌ Raqam kiriting!"); return
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT title FROM animes WHERE id=?", (aid,)) as cur:
+            anime = await cur.fetchone()
+        if not anime:
+            await message.answer(f"❌ ID={aid} topilmadi!"); return
+        await db.execute("DELETE FROM animes WHERE id=?", (aid,))
+        await db.commit()
+    await message.answer(f"✅ *{anime['title']}* o'chirildi!", parse_mode="Markdown")
+
+# ── Main ─────────────────────────────────────────
 async def main():
-    await create_pool()
     await init_db()
     print("✅ Bot ishga tushdi!")
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
     asyncio.run(main())
